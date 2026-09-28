@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 rf_ioc_enricher.py - Recorded Future IOC enrichment for threat hunting
 ======================================================================
@@ -12,9 +13,12 @@ What it does
    Excel, every field for CSV, every line for TXT). Defanged indicators such as
    hxxp://evil[.]com or 1[.]2[.]3[.]4 are re-fanged automatically.
       IPv4 / IPv6, domains, URLs, MD5 / SHA1 / SHA256, CVE IDs
-3. Enriches each unique IOC through the Recorded Future Connect API (v2),
-   requesting ALL enrichment fields the API exposes for that entity type
-   (discovered at runtime via GET /v2/<type>/fields, with safe fallbacks).
+3. Enriches in two fast phases:
+      Phase 1  BULK risk lookup - one POST to /soar/v3/enrichment per 1,000 IOCs
+               (risk score, level, triggered rules + evidence, context scores).
+      Phase 2  DEEP enrichment via the Connect API (location, ASN, intel card,
+               sightings, threat lists, related entities, MITRE links ...) for the
+               IOCs you care about (DEEP_ENRICH = "risky" | "all" | "none").
 4. Writes an enriched workbook (Enriched / Summary / Skipped sheets) or CSV,
    plus a sidecar  <output>_raw.jsonl  containing the untouched API responses
    so nothing RF returns is ever lost.
@@ -108,19 +112,43 @@ OUTPUT_FORMAT = "xlsx"          # "xlsx" (multi-sheet) or "csv" (one file per sh
 # attention sheet: Risk_IPs, Risk_Domains, Risk_Hashes, Risk_URLs, Risk_CVEs.
 RISK_SCORE_THRESHOLD = 0
 
-# Behaviour
+# --- Speed -------------------------------------------------------------------
+# Phase 1 is always a BULK lookup (up to 1000 IOCs per API call) = risk score,
+# risk level, triggered rules and evidence.
+# Phase 2 adds the full Connect-API detail (location, ASN, intel card, sightings,
+# threat lists, related malware, MITRE links...) one IOC at a time, in parallel:
+#     "risky" = only IOCs with score > RISK_SCORE_THRESHOLD   (fast, recommended)
+#     "all"   = every IOC                                     (slower)
+#     "none"  = skip phase 2                                  (fastest)
+DEEP_ENRICH = "risky"
+BATCH_SIZE = 1000               # IOCs per bulk call (RF maximum is 1000)
+WORKERS = 4                     # parallel requests for phase 2 / multiple batches
+TIMEOUT = 60                    # seconds per HTTP request
+
+# --- Network / TLS -------------------------------------------------------------
+# Keep certificate verification ON. If you are behind a corporate proxy that
+# inspects TLS (the most common reason for "SSL / certificate verify failed"),
+# point CA_BUNDLE_PATH at your company's root CA in PEM format, e.g.
+#     CA_BUNDLE_PATH = r"C:\certs\corp-root-ca.pem"
+# (Ask IT for it, or export it from your browser as "Base-64 encoded X.509".)
+# Leave "" to use Python's default trusted CAs.
+VERIFY_SSL = True               # False disables all checks - avoid; use CA_BUNDLE_PATH
+CA_BUNDLE_PATH = ""
+PROXY = ""                      # e.g. "http://proxy.corp:8080" (or user:pass@host:port)
+
+# --- Behaviour -------------------------------------------------------------------
 SKIP_PRIVATE_IPS = True         # don't send RFC1918 / loopback / reserved IPs to RF
 ASK_CONFIRMATION = True         # show the IOC count and ask before using API quota
-WORKERS = 4                     # parallel requests (RF rate-limits; keep <= 5-10)
-TIMEOUT = 30                    # seconds per HTTP request
-VERIFY_SSL = True               # set False only if a corporate proxy breaks TLS
-PROXY = ""                      # e.g. "http://proxy.corp:8080"
 USE_GUI = False                 # True = show the pop-up configuration window instead
 
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-RF_BASE = "https://api.recordedfuture.com/v2"
+RF_BASE = "https://api.recordedfuture.com/v2"                     # Connect API (deep enrichment)
+SOAR_URL = "https://api.recordedfuture.com/soar/v3/enrichment"    # bulk risk enrichment
+SOAR_KEY = {"ip": "ip", "domain": "domain", "url": "url", "hash": "hash", "cve": "vulnerability"}
+TYPE_TO_KIND = {"IpAddress": "ip", "InternetDomainName": "domain", "URL": "url",
+                "Hash": "hash", "CyberVulnerability": "cve"}
 USER_AGENT = "ThreatHunt-RF-Enricher/1.0"
 CELL_LIMIT = 32000  # Excel hard limit is 32,767 chars per cell
 
@@ -150,16 +178,20 @@ RISK_LEVELS = ["Very Malicious", "Malicious", "Suspicious", "Unusual",
 
 PRIORITY_COLS = [
     "IOC", "IOC_Type", "RF_Risk_Level", "RF_Risk_Score", "RF_Criticality_Label",
-    "RF_Rules_Triggered", "RF_Risk_Rules", "RF_Status", "RF_Error",
+    "RF_Rules_Triggered", "RF_Most_Critical_Rule", "RF_Risk_Rules", "RF_Status", "RF_Error",
     "RF_Country", "RF_City", "RF_Continent", "RF_ASN", "RF_Organization",
     "RF_CIDR", "RF_First_Seen", "RF_Last_Seen", "RF_Threat_Lists",
     "RF_Enterprise_Lists", "RF_IntelCard", "RF_AI_Insights", "RF_Risk_Evidence",
-    "Source_Occurrences", "Source_Locations", "RF_Lookup_UTC",
+    "Source_Occurrences", "Source_Locations", "RF_Lookup_UTC", "RF_Deep_Enrichment",
 ]
 
 
 class AuthError(RuntimeError):
     pass
+
+
+class RFFatalError(RuntimeError):
+    """Problem that makes every further request pointless (TLS, proxy, entitlement)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -317,64 +349,159 @@ def _parse_field_list(payload):
     return names if ("entity" in names or "risk" in names) else []
 
 
+def _net_hint(e):
+    n = type(e).__name__
+    if isinstance(e, requests.exceptions.SSLError):
+        return (f"{n}: TLS certificate verification failed - typically a corporate SSL-inspection proxy. "
+                "FIX: set CA_BUNDLE_PATH to your company root CA (.pem), or `pip install pip-system-certs` "
+                f"to use the OS trust store. Details: {str(e)[:200]}")
+    if isinstance(e, requests.exceptions.ProxyError):
+        return f"{n}: proxy problem - set PROXY in the config block (http://host:port). Details: {str(e)[:200]}"
+    return (f"{n}: cannot reach api.recordedfuture.com:443 - check VPN/firewall, set PROXY, or raise TIMEOUT. "
+            f"Details: {str(e)[:200]}")
+
+
+def _norm(kind, v):
+    v = str(v).strip().lower()
+    if kind == "ip":
+        try:
+            return str(ipaddress.ip_address(v))
+        except ValueError:
+            return v
+    if kind == "url":
+        return v.rstrip("/")
+    if kind == "domain":
+        return v.rstrip(".")
+    return v
+
+
 class RFClient:
-    def __init__(self, token, timeout=30, verify=True, proxy="", workers=4, log=print):
-        self.timeout = timeout
-        self.log = log
+    def __init__(self, token, timeout=60, verify=True, proxy="", workers=4, log=print):
+        self.timeout, self.workers, self.log = timeout, max(1, workers), log
         self.s = requests.Session()
-        adapter = HTTPAdapter(pool_connections=workers, pool_maxsize=workers * 2)
+        adapter = HTTPAdapter(pool_connections=self.workers, pool_maxsize=self.workers * 2)
         self.s.mount("https://", adapter)
-        self.s.headers.update({"X-RFToken": token, "X-RF-User-Agent": USER_AGENT,
-                               "Accept": "application/json"})
+        self.s.headers.update({"X-RFToken": token, "X-RF-User-Agent": USER_AGENT, "Accept": "application/json"})
         if proxy:
             self.s.proxies = {"http": proxy, "https": proxy}
-        self.s.verify = verify
-        if not verify:
+        self.s.verify = verify                 # True | False | path to CA bundle
+        if verify is False:
             try:
                 import urllib3
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             except Exception:
                 pass
         self._lock = threading.Lock()
-        self._tiers = {}            # kind -> list of field lists (most -> least)
-        self._good_tier = {}        # kind -> index of tier that last worked
+        self._tiers, self._good_tier = {}, {}
+        self.deep_blocked = set()
+        self.warnings = []
         self.auth_failed = threading.Event()
 
     # -- low level --------------------------------------------------------- #
-    def _request(self, url, params=None):
+    def _request(self, method, url, **kw):
         last = None
         for attempt in range(1, 6):
             if self.auth_failed.is_set():
                 raise AuthError("Authentication failed")
             try:
-                r = self.s.get(url, params=params, timeout=self.timeout)
+                r = self.s.request(method, url, timeout=self.timeout, **kw)
+            except (requests.exceptions.SSLError, requests.exceptions.ProxyError) as e:
+                raise RFFatalError(_net_hint(e))            # not transient: fail fast
             except requests.RequestException as e:
-                last = e
-                time.sleep(min(2 ** attempt, 20))
+                last = _net_hint(e)
+                if attempt >= 3:
+                    raise RFFatalError(last)
+                time.sleep(2 * attempt)
                 continue
             if r.status_code == 429:
                 try:
                     wait = float(r.headers.get("Retry-After", ""))
                 except ValueError:
                     wait = min(2 ** attempt * 2, 60)
-                time.sleep(wait)
                 last = "HTTP 429 (rate limited)"
+                time.sleep(wait)
                 continue
             if r.status_code >= 500:
                 last = f"HTTP {r.status_code}"
-                time.sleep(min(2 ** attempt, 20))
+                time.sleep(min(2 ** attempt, 10))
                 continue
             return r
-        raise RuntimeError(f"Request failed after retries: {last}")
+        raise RFFatalError(f"RF API kept failing ({last})")
 
-    # -- field discovery --------------------------------------------------- #
+    def preflight(self):
+        """Prove TLS + network path works before spending any API quota."""
+        r = self._request("GET", "https://api.recordedfuture.com/")
+        return r.status_code
+
+    # -- PHASE 1: bulk ------------------------------------------------------ #
+    def bulk_enrich(self, items, batch_size=1000, log=None):
+        """items: [(kind, value)]. Returns {(kind, value): (status, payload)}; status OK|NOT_FOUND|ERROR."""
+        log = log or self.log
+        batch_size = max(1, min(int(batch_size), 1000))
+        chunks = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(len(chunks), self.workers) or 1) as ex:
+            for n, part in enumerate(ex.map(self._bulk_chunk, chunks), 1):
+                out.update(part)
+                log(f"  bulk batch {n}/{len(chunks)} done ({len(out)}/{len(items)} IOCs)")
+        return out
+
+    def _bulk_chunk(self, chunk):
+        body = {}
+        for kind, val in chunk:
+            body.setdefault(SOAR_KEY[kind], []).append(val)
+        r = self._request("POST", SOAR_URL, json=body, params={"metadata": "false"})
+        if r.status_code == 200:
+            return self._match(chunk, r.json())
+        if r.status_code == 401:
+            self.auth_failed.set()
+            raise AuthError("HTTP 401 - invalid or expired API token")
+        if r.status_code == 403:
+            raise RFFatalError("HTTP 403 - this token is not entitled to the SOAR enrichment API "
+                               f"(ask your RF admin). Response: {r.text[:200]}")
+        if r.status_code in (400, 422) and len(chunk) > 1:      # isolate the bad IOC(s)
+            mid = len(chunk) // 2
+            res = self._bulk_chunk(chunk[:mid])
+            res.update(self._bulk_chunk(chunk[mid:]))
+            return res
+        msg = f"HTTP {r.status_code}: {r.text[:200].strip()}"
+        return {k: ("ERROR", msg) for k in chunk}
+
+    def _match(self, chunk, body):
+        data = body.get("data", body) if isinstance(body, dict) else body
+        results = data.get("results") if isinstance(data, dict) else data
+        idx = {(k, _norm(k, v)): (k, v) for k, v in chunk}
+        out, unmatched = {}, []
+        for res in results or []:
+            if not isinstance(res, dict):
+                continue
+            ent = res.get("entity") if isinstance(res.get("entity"), dict) else {}
+            name = str(ent.get("name") or "")
+            guess = TYPE_TO_KIND.get(ent.get("type"))
+            order = ([guess] if guess else []) + [k for k in SOAR_KEY if k != guess]
+            for k in order:
+                key = idx.get((k, _norm(k, name)))
+                if key:
+                    out[key] = ("OK", res)
+                    break
+            else:
+                unmatched.append(name)
+        if unmatched:
+            with self._lock:
+                self.warnings.append(f"{len(unmatched)} RF result(s) could not be matched to your input, "
+                                     f"e.g. '{unmatched[0][:80]}'")
+        for key in idx.values():
+            out.setdefault(key, ("NOT_FOUND", None))
+        return out
+
+    # -- PHASE 2: Connect API (deep) -------------------------------------- #
     def _field_tiers(self, kind):
         with self._lock:
             if kind in self._tiers:
                 return self._tiers[kind]
         discovered = []
         try:
-            r = self._request(f"{RF_BASE}/{ENDPOINT[kind]}/fields")
+            r = self._request("GET", f"{RF_BASE}/{ENDPOINT[kind]}/fields")
             if r.status_code == 200:
                 discovered = _parse_field_list(r.json())
             elif r.status_code == 401:
@@ -383,27 +510,25 @@ class RFClient:
             raise
         except Exception:
             pass
-        tiers = []
-        if discovered:
-            tiers.append(discovered)
-            self.log(f"[{TYPE_LABEL[kind]}] requesting all {len(discovered)} RF fields.")
-        else:
-            self.log(f"[{TYPE_LABEL[kind]}] field discovery unavailable, using built-in field set.")
-        tiers += [FALLBACK_FIELDS[kind], MINIMAL_FIELDS]
+        tiers = ([discovered] if discovered else []) + [FALLBACK_FIELDS[kind], MINIMAL_FIELDS]
         with self._lock:
+            if kind in self._tiers:             # another thread got here first
+                return self._tiers[kind]
             self._tiers[kind] = tiers
+        self.log(f"[{TYPE_LABEL[kind]}] deep enrichment: requesting "
+                 f"{len(tiers[0])} RF fields" + ("" if discovered else " (built-in set)"))
         return tiers
 
-    # -- public ------------------------------------------------------------ #
     def lookup(self, kind, value):
-        """Return (status, data, error). status: OK | NOT_FOUND | ERROR"""
+        """Connect API single-entity lookup. Returns (status, data, error)."""
+        if kind in self.deep_blocked:
+            return "ERROR", None, "HTTP 403 - no Connect API entitlement for this IOC type (skipped)"
         ident = quote(value, safe="") if kind == "url" else value
         url = f"{RF_BASE}/{ENDPOINT[kind]}/{ident}"
         tiers = self._field_tiers(kind)
-        start = self._good_tier.get(kind, 0)
         err = ""
-        for i in range(start, len(tiers)):
-            r = self._request(url, {"fields": ",".join(tiers[i])})
+        for i in range(self._good_tier.get(kind, 0), len(tiers)):
+            r = self._request("GET", url, params={"fields": ",".join(tiers[i])})
             if r.status_code == 200:
                 self._good_tier[kind] = i
                 body = r.json()
@@ -415,7 +540,13 @@ class RFClient:
                 raise AuthError("HTTP 401 - invalid or expired API token")
             err = f"HTTP {r.status_code}: {r.text[:200].strip()}"
             if r.status_code in (400, 403) and i < len(tiers) - 1:
-                continue        # try a smaller field set
+                continue
+            if r.status_code == 403:
+                with self._lock:
+                    if kind not in self.deep_blocked:
+                        self.deep_blocked.add(kind)
+                        self.log(f"[{TYPE_LABEL[kind]}] Connect API returned 403 - deep enrichment "
+                                 "not available for this type with your token; skipping the rest.")
             break
         return "ERROR", None, err
 
@@ -610,6 +741,54 @@ def flatten(data: dict) -> dict:
     return row
 
 
+def flatten_soar(res: dict) -> dict:
+    """Flatten one result from POST /soar/v3/enrichment into RF_* columns."""
+    row = {}
+    ent = res.get("entity")
+    if isinstance(ent, dict):
+        row["RF_Entity_ID"], row["RF_Entity_Name"] = ent.get("id"), ent.get("name")
+        row["RF_Entity_Type"], row["RF_Entity_Description"] = ent.get("type"), ent.get("description")
+    risk = res.get("risk") if isinstance(res.get("risk"), dict) else {}
+    score = risk.get("score")
+    row["RF_Risk_Score"] = score
+    row["RF_Risk_Level"] = risk_level(score)
+    row["RF_Criticality"] = risk.get("level")
+    rule = risk.get("rule") if isinstance(risk.get("rule"), dict) else {}
+    cnt, mx = rule.get("count"), rule.get("maxCount")
+    if cnt is not None:
+        row["RF_Rules_Triggered"] = f"{cnt}/{mx}" if mx is not None else str(cnt)
+    row["RF_Most_Critical_Rule"] = rule.get("mostCritical")
+
+    ev = rule.get("evidence")
+    pairs = list(ev.items()) if isinstance(ev, dict) else [(None, v) for v in ev] if isinstance(ev, list) else []
+    names, lines = [], []
+    for k, v in pairs:
+        if isinstance(v, dict):
+            nm = v.get("rule") or k or ""
+            names.append(str(nm))
+            lines.append(f"[{v.get('level', '?')}] {nm}: {v.get('description') or v.get('evidenceString') or ''} "
+                         f"(count={v.get('count', '?')}, {v.get('timestamp', '')})")
+    if not names and isinstance(rule.get("summary"), list):
+        names = [str(x) for x in rule["summary"]]
+    row["RF_Risk_Rules"] = _join(names)
+    row["RF_Risk_Evidence"] = _join(lines, " | ")
+
+    ctx = risk.get("context")
+    if ctx is not None:
+        row["RF_Risk_Context"] = _j(ctx)
+        if isinstance(ctx, dict):
+            for k, v in ctx.items():
+                if isinstance(v, dict) and "score" in v:
+                    row[f"RF_Context_{k}_Score"] = v["score"]
+    for k, v in risk.items():
+        if k not in ("score", "level", "rule", "context"):
+            row[f"RF_Risk_{k}"] = _j(v) if isinstance(v, (dict, list)) else v
+    for k, v in res.items():
+        if k not in ("entity", "risk"):
+            row[f"RF_{k}"] = _j(v) if isinstance(v, (dict, list)) else v
+    return row
+
+
 # --------------------------------------------------------------------------- #
 # Central lookup + orchestration
 # --------------------------------------------------------------------------- #
@@ -619,11 +798,28 @@ class Config:
     input_path: str
     output_path: str
     workers: int = 4
-    timeout: int = 30
+    timeout: int = 60
     skip_private: bool = True
     verify_ssl: bool = True
     proxy: str = ""
     risk_threshold: int = 0
+    ca_bundle: str = ""
+    deep_enrich: str = "risky"
+    batch_size: int = 1000
+
+
+def _verify_setting(cfg: Config):
+    if not cfg.verify_ssl:
+        return False
+    if cfg.ca_bundle:
+        if not os.path.isfile(cfg.ca_bundle):
+            raise RFFatalError(f"CA_BUNDLE_PATH file not found: {cfg.ca_bundle}")
+        return cfg.ca_bundle
+    return True
+
+
+def make_client(cfg: Config, log=print) -> RFClient:
+    return RFClient(cfg.token, cfg.timeout, _verify_setting(cfg), cfg.proxy, cfg.workers, log)
 
 
 def classify_ioc(value: str):
@@ -644,19 +840,7 @@ def classify_ioc(value: str):
     return None, v
 
 
-def central_lookup(client: "RFClient", value: str, kind: str = None, count: int = 1, locs=None):
-    """
-    THE single entry point for enrichment. Give it any indicator; it detects the
-    type (unless `kind` is supplied), routes it to the matching Recorded Future
-    endpoint (ip / domain / url / hash / vulnerability), and returns
-    (flat_row_dict, raw_record).  Raises AuthError on a 401.
-    """
-    locs = locs or []
-    if kind is None:
-        kind, value = classify_ioc(value)
-        if kind is None:
-            return ({"IOC": value, "IOC_Type": "Unknown", "RF_Status": "Unsupported IOC",
-                     "RF_Risk_Level": "Lookup Error", "RF_Error": "Could not classify indicator"}, None)
+def _assemble(kind, value, count, locs, status, payload):
     row = {
         "IOC": value,
         "IOC_Type": TYPE_LABEL[kind],
@@ -664,54 +848,124 @@ def central_lookup(client: "RFClient", value: str, kind: str = None, count: int 
         "Source_Locations": "; ".join(locs) + (" ..." if count > len(locs) else ""),
         "RF_Lookup_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
-    try:
-        status, data, err = client.lookup(kind, value)
-    except AuthError:
-        raise
-    except Exception as e:                       # network etc.
-        status, data, err = "ERROR", None, str(e)[:300]
-
-    row["RF_Status"] = {"OK": "Enriched", "NOT_FOUND": "Not found in RF", "ERROR": "Error"}[status]
-    if status == "OK" and isinstance(data, dict):
-        row.update(flatten(data))
+    raw = {"ioc": value, "type": kind, "status": status, "error": None, "soar": None, "connect": None}
+    if status == "OK" and isinstance(payload, dict):
+        row["RF_Status"] = "Enriched"
+        row.update(flatten_soar(payload))
+        raw["soar"] = payload
     elif status == "NOT_FOUND":
+        row["RF_Status"] = "Not found in RF"
         row["RF_Risk_Level"] = "Not in Recorded Future"
     else:
+        row["RF_Status"] = "Error"
         row["RF_Risk_Level"] = "Lookup Error"
-        row["RF_Error"] = err
-    raw = {"ioc": value, "type": kind, "status": status, "error": err, "data": data}
+        row["RF_Error"] = str(payload)
+        raw["error"] = str(payload)
+    return row, raw
+
+
+def _merge_deep(row, raw, res):
+    status, data, err = res
+    if status == "OK" and isinstance(data, dict):
+        d = flatten(data)
+        if "RF_Risk_Score" not in d:
+            d.pop("RF_Risk_Level", None)
+        row.update({k: v for k, v in d.items() if v not in (None, "")})
+        row["RF_Deep_Enrichment"] = "Done"
+        raw["connect"] = data
+    elif status == "NOT_FOUND":
+        row["RF_Deep_Enrichment"] = "Not found in Connect API"
+    else:
+        row["RF_Deep_Enrichment"] = f"Failed: {err}"
+
+
+def central_lookup(client: RFClient, value: str, kind: str = None, count: int = 1, locs=None, deep: bool = True):
+    """
+    Single-indicator entry point for your own code. Detects the type (unless `kind`
+    is given), does the bulk-API risk lookup, optionally the deep Connect lookup,
+    and returns (flat_row_dict, raw_record).
+    """
+    if kind is None:
+        kind, value = classify_ioc(value)
+        if kind is None:
+            return ({"IOC": value, "IOC_Type": "Unknown", "RF_Status": "Unsupported IOC",
+                     "RF_Risk_Level": "Lookup Error", "RF_Error": "Could not classify indicator"}, None)
+    status, payload = client.bulk_enrich([(kind, value)], 1, lambda m: None)[(kind, value)]
+    row, raw = _assemble(kind, value, count, locs or [], status, payload)
+    if deep and status == "OK":
+        _merge_deep(row, raw, client.lookup(kind, value))
     return row, raw
 
 
 def enrich(cfg: Config, iocs, log, progress, cancel: threading.Event):
-    client = RFClient(cfg.token, cfg.timeout, cfg.verify_ssl, cfg.proxy, cfg.workers, log)
-    rows, raws = [], []
+    client = make_client(cfg, log)
     total = len(iocs)
 
-    def work(item):
-        if cancel.is_set() or client.auth_failed.is_set():
-            return None
-        try:
-            return central_lookup(client, item["value"], item["kind"], item["count"], item["locs"])
-        except AuthError:
-            return None
+    log("Checking network / TLS path to api.recordedfuture.com ...")
+    code = client.preflight()
+    log(f"  reachable (HTTP {code}).")
 
-    done = 0
-    with ThreadPoolExecutor(max_workers=max(1, cfg.workers)) as ex:
-        for fut in as_completed([ex.submit(work, it) for it in iocs]):
-            res = fut.result()
-            done += 1
-            progress(done, total)
-            if res is not None:
-                rows.append(res[0])
-                raws.append(res[1])
-            if done % 10 == 0 or done == total:
-                log(f"  {done}/{total} looked up")
+    # ---------------- Phase 1: bulk ----------------
+    log(f"Phase 1/2 - bulk risk lookup: {total} IOCs in batches of {min(cfg.batch_size, 1000)} ...")
+    t0 = time.time()
+    results = client.bulk_enrich([(i["kind"], i["value"]) for i in iocs], cfg.batch_size, log)
+    log(f"  bulk lookup finished in {time.time() - t0:.1f}s")
+    for w in client.warnings:
+        log("  WARNING: " + w)
+    progress(total, total)
+
+    rows, raws, by_key = [], [], {}
+    for it in iocs:
+        key = (it["kind"], it["value"])
+        status, payload = results.get(key, ("ERROR", "no response from RF"))
+        row, raw = _assemble(it["kind"], it["value"], it["count"], it["locs"], status, payload)
+        rows.append(row)
+        raws.append(raw)
+        by_key[key] = (row, raw)
+
+    # ---------------- Phase 2: deep ----------------
+    policy = str(cfg.deep_enrich).lower()
+    if policy == "all":
+        cand = [k for k, (r, _) in by_key.items() if r["RF_Status"] == "Enriched"]
+    elif policy == "risky":
+        cand = [k for k, (r, _) in by_key.items() if r["RF_Status"] == "Enriched" and is_risky(r, cfg.risk_threshold)]
+    else:
+        cand = []
+    for k, (r, _) in by_key.items():
+        if k not in cand:
+            r["RF_Deep_Enrichment"] = ("Skipped (deep enrichment off)" if policy == "none" else
+                                       f"Skipped (score <= {cfg.risk_threshold})" if policy == "risky" else "Skipped")
+
+    if cand and not cancel.is_set():
+        log(f"Phase 2/2 - deep Connect-API enrichment for {len(cand)} IOC(s) (policy: {policy}) ...")
+
+        def deep(key):
+            if cancel.is_set() or client.auth_failed.is_set():
+                return key, None
+            try:
+                return key, client.lookup(*key)
+            except AuthError:
+                return key, None
+            except RFFatalError as e:
+                return key, ("ERROR", None, str(e)[:250])
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=max(1, cfg.workers)) as ex:
+            for fut in as_completed([ex.submit(deep, k) for k in cand]):
+                key, res = fut.result()
+                done += 1
+                progress(done, len(cand))
+                if res is not None:
+                    _merge_deep(*by_key[key], res)
+                if done % 10 == 0 or done == len(cand):
+                    log(f"  {done}/{len(cand)} deep lookups")
+    elif not cand:
+        log("Phase 2/2 - nothing to deep-enrich.")
 
     if client.auth_failed.is_set():
         raise AuthError("Authentication failed (HTTP 401). Check that the API token is valid and active.")
     rows.sort(key=lambda r: (not isinstance(r.get("RF_Risk_Score"), (int, float)), -(r.get("RF_Risk_Score") or 0)))
-    return rows, [r for r in raws if r]
+    return rows, raws
 
 
 # --------------------------------------------------------------------------- #
@@ -963,6 +1217,7 @@ if HAVE_TK:
             self.v_out = tk.StringVar(value=default_output_path(INPUT_FILE) if os.path.isfile(INPUT_FILE) else "")
             self.v_workers = tk.IntVar(value=WORKERS)
             self.v_timeout = tk.IntVar(value=TIMEOUT)
+            self.v_ca = tk.StringVar(value=CA_BUNDLE_PATH)
             self.v_priv = tk.BooleanVar(value=SKIP_PRIVATE_IPS)
             self.v_ssl = tk.BooleanVar(value=VERIFY_SSL)
             self.v_proxy = tk.StringVar(value=PROXY or os.environ.get("HTTPS_PROXY", ""))
@@ -994,8 +1249,12 @@ if HAVE_TK:
             ttk.Entry(box, textvariable=self.v_proxy).grid(row=3, column=1, sticky="ew", **pad)
             ttk.Label(box, text="http://host:port", foreground="#777").grid(row=3, column=2, sticky="w", **pad)
 
+            ttk.Label(box, text="CA bundle (optional)").grid(row=4, column=0, sticky="w", **pad)
+            ttk.Entry(box, textvariable=self.v_ca).grid(row=4, column=1, sticky="ew", **pad)
+            ttk.Button(box, text="Browse\u2026", command=self._pick_ca).grid(row=4, column=2, **pad)
+
             opt = ttk.Frame(box)
-            opt.grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 8))
+            opt.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 8))
             ttk.Label(opt, text="Parallel requests").pack(side="left")
             ttk.Spinbox(opt, from_=1, to=10, width=4, textvariable=self.v_workers).pack(side="left", padx=(4, 14))
             ttk.Label(opt, text="Timeout (s)").pack(side="left")
@@ -1028,6 +1287,12 @@ if HAVE_TK:
                 self.v_in.set(p)
                 if not self.v_out.get():
                     self.v_out.set(default_output_path(p))
+
+        def _pick_ca(self):
+            p = filedialog.askopenfilename(title="Select CA bundle / root certificate",
+                                           filetypes=[("Certificates", "*.pem *.crt *.cer"), ("All files", "*.*")])
+            if p:
+                self.v_ca.set(p)
 
         def _pick_out(self):
             p = filedialog.asksaveasfilename(
@@ -1090,7 +1355,8 @@ if HAVE_TK:
                          workers=int(self.v_workers.get()), timeout=int(self.v_timeout.get()),
                          skip_private=self.v_priv.get(), verify_ssl=self.v_ssl.get(),
                          proxy=self.v_proxy.get().strip(),
-                         risk_threshold=RISK_SCORE_THRESHOLD)
+                         risk_threshold=RISK_SCORE_THRESHOLD, ca_bundle=self.v_ca.get().strip(),
+                         deep_enrich=DEEP_ENRICH, batch_size=BATCH_SIZE)
             self.cancel.clear()
             self._confirm_evt.clear()
             self.b_start.config(state="disabled")
@@ -1138,7 +1404,8 @@ def run_headless(args):
     folder = args.output_folder if args.output_folder is not None else OUTPUT_FOLDER
     cfg = Config(token=token, input_path=inp, output_path=make_output_path(folder, inp, OUTPUT_FORMAT),
                  workers=WORKERS, timeout=TIMEOUT, skip_private=SKIP_PRIVATE_IPS,
-                 verify_ssl=VERIFY_SSL, proxy=PROXY, risk_threshold=RISK_SCORE_THRESHOLD)
+                 verify_ssl=VERIFY_SSL, proxy=PROXY, risk_threshold=RISK_SCORE_THRESHOLD,
+                 ca_bundle=CA_BUNDLE_PATH, deep_enrich=DEEP_ENRICH, batch_size=BATCH_SIZE)
     log = lambda m: print(m, flush=True)
 
     log(f"Reading {cfg.input_path} ...")
@@ -1170,7 +1437,10 @@ def main():
             return
         except tk.TclError:
             print("No display available - continuing in headless mode.")
-    run_headless(args)
+    try:
+        run_headless(args)
+    except (AuthError, RFFatalError) as e:
+        sys.exit(f"\nERROR: {e}")
 
 
 if __name__ == "__main__":
